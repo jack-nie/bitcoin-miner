@@ -149,21 +149,11 @@ func (s *server) processReceivedMessageLoop(client *clientStub) {
 				select {
 				case s.readChan <- message:
 					client.pendingReceivedMessageQueue.Remove(e)
-					// case <-c.toCloseChan:
-					// 	if c.processCloseChan() {
-					// 		closeClientChan <- c.connID
-					// 		return
-					// 	}
 				}
 			} else {
 				select {
 				case s.readChan <- message:
 					client.pendingReceivedMessageQueue.Remove(e)
-					// case <-c.toCloseChan:
-					// 	if c.processCloseChan() {
-					// 		closeClientChan <- c.connID
-					// 		return
-					// 	}
 				}
 			}
 		}
