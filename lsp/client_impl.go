@@ -12,30 +12,39 @@ import (
 )
 
 type client struct {
+	mutex sync.RWMutex
+
 	connID                      int
 	readChan                    chan *Message
 	writeChan                   chan *Message
 	receivedMessageChan         chan *Message
-	closeChan                   chan struct{}
 	conn                        *lspnet.UDPConn
-	isClosed                    bool
-	epochLimit                  int
-	epochMills                  int
 	windowSize                  int
 	seqNum                      int32
-	epochFiredCount             int
-	epochTimer                  *time.Ticker
 	firstDataMessageReceived    bool
 	receivedMessageSeqNum       int32
 	lastProcessedMessageSeqNum  int32
 	pendingReceivedMessages     map[int]*Message
 	pendingReceivedMessageQueue *list.List
-	mutex                       sync.RWMutex
 	pendingSendMessages         *list.List
 	pendingReSendMessages       map[int]*Message
 	slideWindow                 *list.List
 	lastAckSeqNum               int32
 	unAckedMessages             map[int]bool
+
+	// epoch
+	epochFiredCount int
+	epochTimer      *time.Ticker
+	epochLimit      int
+	epochMills      int
+
+	// 退出相关
+	isClosed                bool
+	connLost                bool
+	eventsRoutineExitChan   chan int
+	toExitEventsRoutineChan chan int
+	readRoutineExitChan     chan int
+	closeChan               chan int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -68,8 +77,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		epochTimer:                  time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis)),
 		seqNum:                      0,
 		epochFiredCount:             0,
-		isClosed:                    false,
-		closeChan:                   make(chan struct{}),
 		firstDataMessageReceived:    true,
 		receivedMessageSeqNum:       0,
 		lastProcessedMessageSeqNum:  1,
@@ -81,6 +88,12 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		pendingReSendMessages:       make(map[int]*Message),
 		unAckedMessages:             make(map[int]bool),
 		receivedMessageChan:         make(chan *Message),
+		isClosed:                    false,
+		connLost:                    false,
+		closeChan:                   make(chan int),
+		eventsRoutineExitChan:       make(chan int),
+		toExitEventsRoutineChan:     make(chan int),
+		readRoutineExitChan:         make(chan int),
 	}
 
 	bytes, err := MarshalMessage(NewConnect())
@@ -115,7 +128,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 				c.connID = ackMessage.ConnID
 				go c.handleRead()
 				go c.handleEvents()
-				//go c.processReceivedMessageLoop()
 				return c, nil
 			}
 		}
@@ -144,7 +156,7 @@ func (c *client) sendAck(msg *Message) {
 }
 
 func (c *client) Write(payload []byte) error {
-	if c.isClosed == true {
+	if c.isClosed || c.connLost {
 		return ErrConnClosed
 	}
 	atomic.AddInt32(&c.seqNum, 1)
@@ -164,33 +176,49 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
+	c.closeChan <- 1
+	<-c.toExitEventsRoutineChan
+
 	c.conn.Close()
-	c.isClosed = true
-	c.closeChan <- struct{}{}
+	c.readRoutineExitChan <- 1
+	c.eventsRoutineExitChan <- 1
 	return nil
 }
 
 func (c *client) handleRead() {
 	for {
-		payload := make([]byte, MaxMessageSize)
-		if c.isClosed {
+		select {
+		case <-c.readRoutineExitChan:
 			return
-		}
-		n, err := c.conn.Read(payload)
-		if err != nil {
-			return
-		}
-		message := UnMarshalMessage(payload[:n])
-		c.epochFiredCount = 0
-		switch message.Type {
-		case MsgData:
-			c.sendAck(message)
-			// 若收到第一个data message，则epochTimer触发时，不用再发送ACK
+		default:
+			payload := make([]byte, MaxMessageSize)
+			if c.isClosed {
+				return
+			}
+			n, err := c.conn.Read(payload)
+			if err != nil {
+				return
+			}
+			message := UnMarshalMessage(payload[:n])
 			c.epochFiredCount = 0
-			atomic.AddInt32(&c.receivedMessageSeqNum, 1)
-			c.receivedMessageChan <- message
-		case MsgAck:
-			c.processAckMessage(message)
+			switch message.Type {
+			case MsgData:
+				if !c.isClosed || !c.connLost {
+					c.sendAck(message)
+					// 若收到第一个data message，则epochTimer触发时，不用再发送ACK
+					c.epochFiredCount = 0
+					atomic.AddInt32(&c.receivedMessageSeqNum, 1)
+					c.receivedMessageChan <- message
+				}
+			case MsgAck:
+				if !c.connLost {
+					c.processAckMessage(message)
+					if c.isClosed && c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 {
+						c.epochTimer.Stop()
+						c.toExitEventsRoutineChan <- 1
+					}
+				}
+			}
 		}
 	}
 }
@@ -213,31 +241,29 @@ func (c *client) handleEvents() {
 				}
 			}
 		case <-c.epochTimer.C:
-			if c.isClosed {
-				return
-			}
 			c.epochFiredCount++
 			if c.epochFiredCount > c.epochLimit {
-				return
+				c.connLost = true
+				if c.isClosed {
+					c.epochTimer.Stop()
+					c.toExitEventsRoutineChan <- 1
+				}
+			} else {
+				c.processPendingReSendMessages()
+				c.resendAckMessages()
 			}
-			c.processPendingReSendMessages()
-			c.resendAckMessages()
 		case msg := <-c.receivedMessageChan:
 			c.processReceivedMessage(msg)
 		case <-c.closeChan:
+			c.isClosed = true
+			if c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 || c.connLost {
+				c.epochTimer.Stop()
+				c.toExitEventsRoutineChan <- 1
+			}
+		case <-c.eventsRoutineExitChan:
 			return
 		}
 	}
-}
-
-func (c *client) processReceivedMessageLoop() {
-	for {
-		select {
-		case message := <-c.receivedMessageChan:
-			c.processReceivedMessage(message)
-		}
-	}
-
 }
 
 func (c *client) processReceivedMessage(message *Message) {
