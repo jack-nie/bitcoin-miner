@@ -15,6 +15,7 @@ type client struct {
 	connID                      int
 	readChan                    chan *Message
 	writeChan                   chan *Message
+	receivedMessageChan         chan *Message
 	closeChan                   chan struct{}
 	conn                        *lspnet.UDPConn
 	isClosed                    bool
@@ -79,6 +80,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		pendingSendMessages:         list.New(),
 		pendingReSendMessages:       make(map[int]*Message),
 		unAckedMessages:             make(map[int]bool),
+		receivedMessageChan:         make(chan *Message),
 	}
 
 	bytes, err := MarshalMessage(NewConnect())
@@ -114,6 +116,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 				go c.handleRead()
 				go c.handleWrite()
 				go c.processEpochEvents()
+				go c.processReceivedMessageLoop()
 				return c, nil
 			}
 		}
@@ -184,11 +187,9 @@ func (c *client) handleRead() {
 		case MsgData:
 			c.sendAck(message)
 			// 若收到第一个data message，则epochTimer触发时，不用再发送ACK
-			if !c.firstDataMessageReceived {
-				c.firstDataMessageReceived = true
-			}
-			c.processReceivedMessage(message)
-			go c.processReceivedMessageLoop()
+			c.epochFiredCount = 0
+			atomic.AddInt32(&c.receivedMessageSeqNum, 1)
+			c.receivedMessageChan <- message
 		case MsgAck:
 			c.processAckMessage(message)
 		}
@@ -225,6 +226,10 @@ func (c *client) processEpochEvents() {
 			if c.isClosed {
 				return
 			}
+			c.epochFiredCount++
+			if c.epochFiredCount > c.epochLimit {
+				return
+			}
 			c.processPendingReSendMessages()
 			c.resendAckMessages()
 		case <-c.closeChan:
@@ -234,6 +239,28 @@ func (c *client) processEpochEvents() {
 }
 
 func (c *client) processReceivedMessageLoop() {
+	for {
+		select {
+		case message := <-c.receivedMessageChan:
+			c.processReceivedMessage(message)
+		}
+	}
+
+}
+
+func (c *client) processReceivedMessage(message *Message) {
+	// 重置epochFiredCount，接受到的消息数目+1
+	if _, ok := c.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(c.lastProcessedMessageSeqNum) {
+		c.pendingReceivedMessages[message.SeqNum] = message
+		for i := int(c.lastProcessedMessageSeqNum); ; i++ {
+			if _, ok := c.pendingReceivedMessages[i]; !ok {
+				break
+			}
+			c.pendingReceivedMessageQueue.PushBack(c.pendingReceivedMessages[i])
+			delete(c.pendingReceivedMessages, i)
+			atomic.AddInt32(&c.lastProcessedMessageSeqNum, 1)
+		}
+	}
 	for e := c.pendingReceivedMessageQueue.Front(); e != nil; e = c.pendingReceivedMessageQueue.Front() {
 		message := e.Value.(*Message)
 		if !c.isClosed {
@@ -246,21 +273,6 @@ func (c *client) processReceivedMessageLoop() {
 			case c.readChan <- message:
 				c.pendingReceivedMessageQueue.Remove(e)
 			}
-		}
-	}
-}
-
-func (c *client) processReceivedMessage(message *Message) {
-	atomic.AddInt32(&c.receivedMessageSeqNum, 1)
-	if _, ok := c.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(c.receivedMessageSeqNum) {
-		c.pendingReceivedMessages[message.SeqNum] = message
-		for i := int(c.lastProcessedMessageSeqNum); ; i++ {
-			if _, ok := c.pendingReceivedMessages[i]; !ok {
-				break
-			}
-			c.pendingReceivedMessageQueue.PushBack(c.pendingReceivedMessages[i])
-			delete(c.pendingReceivedMessages, i)
-			atomic.AddInt32(&c.lastProcessedMessageSeqNum, 1)
 		}
 	}
 }
@@ -314,7 +326,13 @@ func (c *client) processPendingReSendMessages() {
 }
 
 func (c *client) resendAckMessages() {
-	if !c.firstDataMessageReceived {
+	if atomic.LoadInt32(&c.lastProcessedMessageSeqNum) != 0 {
+		i := c.receivedMessageSeqNum - 1
+		for j := c.windowSize; j > 0 && i > 0; j-- {
+			c.writeChan <- NewAck(c.connID, int(i))
+			i--
+		}
+	} else {
 		c.writeChan <- NewAck(c.connID, 0)
 	}
 }

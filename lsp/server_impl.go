@@ -13,17 +13,16 @@ import (
 )
 
 type server struct {
-	mutex              sync.Mutex
-	epochLimit         int
-	epochTimer         *time.Ticker
-	windowSize         int
-	conn               *lspnet.UDPConn
-	clients            map[int]*clientStub
-	nextClientID       int
-	receiveMessageChan chan *Message
-	isClosed           bool
-	closeChan          chan struct{}
-	readChan           chan *Message
+	mutex        sync.Mutex
+	windowSize   int
+	epochLimit   int
+	epochTimer   *time.Ticker
+	conn         *lspnet.UDPConn
+	clients      map[int]*clientStub
+	nextClientID int
+	isClosed     bool
+	closeChan    chan struct{}
+	readChan     chan *Message
 }
 
 type clientStub struct {
@@ -45,6 +44,10 @@ type clientStub struct {
 	lastAckSeqNum               int32
 	unAckedMessages             map[int]bool
 	windowSize                  int
+	epochFiredCount             int
+	epochLimit                  int
+	epochTimer                  *time.Ticker
+	receivedMessageChan         chan *Message
 }
 
 type messageStub struct {
@@ -68,19 +71,17 @@ func NewServer(port int, params *Params) (Server, error) {
 		return nil, err
 	}
 	server := &server{
-		epochLimit:         params.EpochLimit,
-		epochTimer:         time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis)),
-		windowSize:         params.WindowSize,
-		conn:               conn,
-		clients:            make(map[int]*clientStub),
-		closeChan:          make(chan struct{}),
-		nextClientID:       0,
-		receiveMessageChan: make(chan *Message),
-		readChan:           make(chan *Message, 10),
+		epochLimit:   params.EpochLimit,
+		epochTimer:   time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis)),
+		windowSize:   params.WindowSize,
+		conn:         conn,
+		clients:      make(map[int]*clientStub),
+		closeChan:    make(chan struct{}),
+		nextClientID: 0,
+		readChan:     make(chan *Message, 10),
 	}
 
 	go server.handleConn(conn)
-	go server.processEpochEvents()
 	return server, nil
 }
 
@@ -100,9 +101,11 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 			case MsgAck:
 				s.processAckMessage(message)
 			case MsgData:
-				s.processReceivedMessage(message)
-				s.processReceivedMessageLoop(s.clients[message.ConnID])
-				s.clients[message.ConnID].writeChan <- NewAck(message.ConnID, message.SeqNum)
+				client := s.clients[message.ConnID]
+				atomic.AddInt32(&client.receivedMessageSeqNum, 1)
+				client.epochFiredCount = 0
+				client.writeChan <- NewAck(message.ConnID, message.SeqNum)
+				client.receivedMessageChan <- message
 			case MsgConnect:
 				client := &clientStub{
 					connID:                      int(s.nextClientID),
@@ -117,11 +120,15 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 					pendingReceivedMessageQueue: list.New(),
 					receivedMessageSeqNum:       0,
 					pendingReSendMessages:       make(map[int]*Message),
+					receivedMessageChan:         make(chan *Message),
 					lastProcessedMessageSeqNum:  1,
 					slideWindow:                 list.New(),
 					lastAckSeqNum:               0,
-					windowSize:                  s.windowSize,
 					unAckedMessages:             make(map[int]bool),
+					epochLimit:                  s.epochLimit,
+					epochTimer:                  s.epochTimer,
+					windowSize:                  s.windowSize,
+					epochFiredCount:             0,
 				}
 				s.mutex.Lock()
 				s.clients[s.nextClientID] = client
@@ -129,40 +136,49 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 				client.writeChan <- NewAck(client.connID, int(client.seqNum))
 				s.nextClientID++
 				go s.handleWrite(client)
+				go client.processReceivedMessageLoop(s)
+				go client.processEpochEvents()
 			}
 		}
 	}
 }
 
-func (s *server) processReceivedMessageLoop(client *clientStub) {
-	for e := client.pendingReceivedMessageQueue.Front(); e != nil; e = client.pendingReceivedMessageQueue.Front() {
+func (c *clientStub) processReceivedMessageLoop(s *server) {
+	for {
+		select {
+		case message := <-c.receivedMessageChan:
+			c.processReceivedMessage(message, s)
+		}
+	}
+
+}
+
+func (c *clientStub) processReceivedMessage(message *Message, s *server) {
+
+	if _, ok := c.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(c.lastProcessedMessageSeqNum) {
+		c.pendingReceivedMessages[message.SeqNum] = message
+		for i := int(c.lastProcessedMessageSeqNum); ; i++ {
+			if _, ok := c.pendingReceivedMessages[i]; !ok {
+				break
+			}
+			c.pendingReceivedMessageQueue.PushBack(c.pendingReceivedMessages[i])
+			delete(c.pendingReceivedMessages, i)
+			atomic.AddInt32(&c.lastProcessedMessageSeqNum, 1)
+		}
+	}
+
+	for e := c.pendingReceivedMessageQueue.Front(); e != nil; e = c.pendingReceivedMessageQueue.Front() {
 		message := e.Value.(*Message)
-		if !client.isClosed {
+		if !c.isClosed {
 			select {
 			case s.readChan <- message:
-				client.pendingReceivedMessageQueue.Remove(e)
+				c.pendingReceivedMessageQueue.Remove(e)
 			}
 		} else {
 			select {
 			case s.readChan <- message:
-				client.pendingReceivedMessageQueue.Remove(e)
+				c.pendingReceivedMessageQueue.Remove(e)
 			}
-		}
-	}
-}
-
-func (s *server) processReceivedMessage(message *Message) {
-	client := s.clients[message.ConnID]
-	atomic.AddInt32(&client.receivedMessageSeqNum, 1)
-	if _, ok := client.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(client.receivedMessageSeqNum) {
-		client.pendingReceivedMessages[message.SeqNum] = message
-		for i := int(client.lastProcessedMessageSeqNum); ; i++ {
-			if _, ok := client.pendingReceivedMessages[i]; !ok {
-				break
-			}
-			client.pendingReceivedMessageQueue.PushBack(client.pendingReceivedMessages[i])
-			delete(client.pendingReceivedMessages, i)
-			atomic.AddInt32(&client.lastProcessedMessageSeqNum, 1)
 		}
 	}
 }
@@ -242,24 +258,32 @@ func (s *server) Close() error {
 	return nil
 }
 
-func (s *server) resendAckMessages() {
-	for _, client := range s.clients {
-		if atomic.LoadInt32(&client.lastProcessedMessageSeqNum) == 0 && !client.isClosed {
-			client.writeChan <- NewAck(client.connID, 0)
+func (c *clientStub) resendAckMessages() {
+	if atomic.LoadInt32(&c.receivedMessageSeqNum) == 0 && !c.isClosed {
+		c.writeChan <- NewAck(c.connID, 0)
+	} else {
+		i := c.lastProcessedMessageSeqNum - 1
+		for j := c.windowSize; j > 0 && i > 0; j-- {
+			c.writeChan <- NewAck(c.connID, int(i))
+			i--
 		}
 	}
 }
 
-func (s *server) processEpochEvents() {
+func (c *clientStub) processEpochEvents() {
 	for {
 		select {
-		case <-s.epochTimer.C:
-			if s.isClosed && len(s.clients) == 0 {
+		case <-c.epochTimer.C:
+			if c.isClosed {
 				return
 			}
-			s.processPendingReSendMessages()
-			s.resendAckMessages()
-		case <-s.closeChan:
+			c.epochFiredCount++
+			if c.epochFiredCount > c.epochLimit {
+				return
+			}
+			c.processPendingReSendMessages()
+			c.resendAckMessages()
+		case <-c.closeChan:
 			return
 		}
 	}
@@ -302,15 +326,13 @@ func (c *clientStub) processPendingSendMessages() {
 	}
 }
 
-func (s *server) processPendingReSendMessages() {
-	for _, c := range s.clients {
-		for _, message := range c.pendingReSendMessages {
-			if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize < message.SeqNum {
-				continue
-			}
-			if _, ok := c.unAckedMessages[message.SeqNum]; ok {
-				c.writeChan <- message
-			}
+func (c *clientStub) processPendingReSendMessages() {
+	for _, message := range c.pendingReSendMessages {
+		if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize < message.SeqNum {
+			continue
+		}
+		if _, ok := c.unAckedMessages[message.SeqNum]; ok {
+			c.writeChan <- message
 		}
 	}
 }
