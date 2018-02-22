@@ -114,9 +114,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 			if ackMessage.Type == MsgAck && ackMessage.SeqNum == 0 {
 				c.connID = ackMessage.ConnID
 				go c.handleRead()
-				go c.handleWrite()
-				go c.processEpochEvents()
-				go c.processReceivedMessageLoop()
+				go c.handleEvents()
+				//go c.processReceivedMessageLoop()
 				return c, nil
 			}
 		}
@@ -196,7 +195,7 @@ func (c *client) handleRead() {
 	}
 }
 
-func (c *client) handleWrite() {
+func (c *client) handleEvents() {
 	for {
 		select {
 		case message := <-c.writeChan:
@@ -213,15 +212,6 @@ func (c *client) handleWrite() {
 					continue
 				}
 			}
-		case <-c.closeChan:
-			return
-		}
-	}
-}
-
-func (c *client) processEpochEvents() {
-	for {
-		select {
 		case <-c.epochTimer.C:
 			if c.isClosed {
 				return
@@ -232,6 +222,8 @@ func (c *client) processEpochEvents() {
 			}
 			c.processPendingReSendMessages()
 			c.resendAckMessages()
+		case msg := <-c.receivedMessageChan:
+			c.processReceivedMessage(msg)
 		case <-c.closeChan:
 			return
 		}

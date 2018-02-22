@@ -135,9 +135,8 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 				s.mutex.Unlock()
 				client.writeChan <- NewAck(client.connID, int(client.seqNum))
 				s.nextClientID++
-				go s.handleWrite(client)
-				go client.processReceivedMessageLoop(s)
-				go client.processEpochEvents()
+				go s.handleEvents(client)
+				//go client.processReceivedMessageLoop(s)
 			}
 		}
 	}
@@ -183,10 +182,10 @@ func (c *clientStub) processReceivedMessage(message *Message, s *server) {
 	}
 }
 
-func (s *server) handleWrite(client *clientStub) {
+func (s *server) handleEvents(c *clientStub) {
 	for {
 		select {
-		case message, ok := <-client.writeChan:
+		case message, ok := <-c.writeChan:
 			if !ok {
 				return
 			}
@@ -195,14 +194,26 @@ func (s *server) handleWrite(client *clientStub) {
 				return
 			}
 			if message.Type == MsgData {
-				client.pendingReSendMessages[message.SeqNum] = message
+				c.pendingReSendMessages[message.SeqNum] = message
 			}
-			if !s.isClosed && !client.isClosed {
-				_, err = client.conn.WriteToUDP(bytes, client.addr)
+			if !s.isClosed && !c.isClosed {
+				_, err = c.conn.WriteToUDP(bytes, c.addr)
 				if err != nil {
 					return
 				}
 			}
+		case <-c.epochTimer.C:
+			if c.isClosed {
+				return
+			}
+			c.epochFiredCount++
+			if c.epochFiredCount > c.epochLimit {
+				return
+			}
+			c.processPendingReSendMessages()
+			c.resendAckMessages()
+		case msg := <-c.receivedMessageChan:
+			c.processReceivedMessage(msg, s)
 		case <-s.closeChan:
 			return
 		}
