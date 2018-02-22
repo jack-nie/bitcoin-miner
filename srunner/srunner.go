@@ -60,7 +60,7 @@ func runServer(srv lsp.Server) {
 		} else {
 			log.Printf("Server received '%s' from client %d\n", string(payload), id)
 			// Echo message back to client.
-			fmt.Println(id)
+			fmt.Println(id, "this is a id", payload)
 			if err := srv.Write(id, payload); err != nil {
 				// Print an error message and continue...
 				fmt.Printf("Server failed to write to connection %d: %s\n", id, err)

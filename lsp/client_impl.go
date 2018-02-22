@@ -4,7 +4,6 @@ package lsp
 
 import (
 	"container/list"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,7 +114,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 				go c.handleRead()
 				go c.handleWrite()
 				go c.processEpochEvents()
-				go c.processReceivedMessageLoop()
 				return c, nil
 			}
 		}
@@ -190,6 +188,7 @@ func (c *client) handleRead() {
 				c.firstDataMessageReceived = true
 			}
 			c.processReceivedMessage(message)
+			go c.processReceivedMessageLoop()
 		case MsgAck:
 			c.processAckMessage(message)
 		}
@@ -200,7 +199,6 @@ func (c *client) handleWrite() {
 	for {
 		select {
 		case message := <-c.writeChan:
-			fmt.Println("data write client:", message.String())
 			if !c.isClosed {
 				if message.Type == MsgData {
 					c.pendingReSendMessages[message.SeqNum] = message
@@ -210,7 +208,6 @@ func (c *client) handleWrite() {
 					continue
 				}
 				_, err = c.conn.Write(bytes)
-				fmt.Println("===", err)
 				if err != nil {
 					continue
 				}
@@ -225,19 +222,11 @@ func (c *client) processEpochEvents() {
 	for {
 		select {
 		case <-c.epochTimer.C:
-			// if c.epochFiredCount >= c.epochLimit {
-			// 	c.closeChan <- struct{}{}
-			// 	c.isClosed = true
-			// 	return
-			// }
-			//c.epochFiredCount++
 			if c.isClosed {
 				return
 			}
 			c.processPendingReSendMessages()
-			// 如果没有收到第一个dataMessage，则每次epochTimer触发，重新发送ACK
 			c.resendAckMessages()
-			//c.epochFiredCount++
 		case <-c.closeChan:
 			return
 		}
@@ -245,20 +234,17 @@ func (c *client) processEpochEvents() {
 }
 
 func (c *client) processReceivedMessageLoop() {
-	for {
-		if c.pendingReceivedMessageQueue.Len() != 0 {
-			e := c.pendingReceivedMessageQueue.Front()
-			message := e.Value.(*Message)
-			if !c.isClosed {
-				select {
-				case c.readChan <- message:
-					c.pendingReceivedMessageQueue.Remove(e)
-				}
-			} else {
-				select {
-				case c.readChan <- message:
-					c.pendingReceivedMessageQueue.Remove(e)
-				}
+	for e := c.pendingReceivedMessageQueue.Front(); e != nil; e = c.pendingReceivedMessageQueue.Front() {
+		message := e.Value.(*Message)
+		if !c.isClosed {
+			select {
+			case c.readChan <- message:
+				c.pendingReceivedMessageQueue.Remove(e)
+			}
+		} else {
+			select {
+			case c.readChan <- message:
+				c.pendingReceivedMessageQueue.Remove(e)
 			}
 		}
 	}
@@ -307,7 +293,7 @@ func (c *client) processPendingSendMessages() {
 		// 如果的消息超过了滑动窗口的上线，则暂存消息，等待后续处理
 		next = e.Next()
 		message := e.Value.(*Message)
-		if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize <= message.SeqNum {
+		if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize < message.SeqNum {
 			break
 		}
 		c.slideWindow.PushBack(message)

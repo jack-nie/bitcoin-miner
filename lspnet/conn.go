@@ -5,7 +5,6 @@ package lspnet
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -67,10 +66,8 @@ func (c *UDPConn) Read(b []byte) (n int, err error) {
 func (c *UDPConn) ReadFromUDP(b []byte) (n int, addr *UDPAddr, err error) {
 	var naddr *net.UDPAddr
 	var buffer [2000]byte
-	fmt.Println("go here=================")
 	for {
 		n, naddr, err = c.nconn.ReadFromUDP(buffer[0:])
-		fmt.Println(n)
 		if sometimes(readDropPercent(c)) {
 			if isLoggingEnabled() {
 				log.Printf("DROPPING read packet of length %d\n", n)
@@ -84,7 +81,6 @@ func (c *UDPConn) ReadFromUDP(b []byte) (n int, addr *UDPAddr, err error) {
 		}
 	}
 
-	fmt.Println("outside for loop=================")
 	return n, addr, err
 }
 

@@ -4,7 +4,6 @@ package lsp
 
 import (
 	"container/list"
-	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -79,6 +78,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		receiveMessageChan: make(chan *Message),
 		readChan:           make(chan *Message, 10),
 	}
+
 	go server.handleConn(conn)
 	go server.processEpochEvents()
 	return server, nil
@@ -88,13 +88,9 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 	for {
 		select {
 		case <-s.closeChan:
-			fmt.Println("close===================")
 		default:
-
 			buffer := make([]byte, MaxMessageSize)
-			fmt.Println("=========++++++++++++++++++++++++++")
 			n, addr, err := conn.ReadFromUDP(buffer)
-			fmt.Println("heere in the loop ", err)
 			if err != nil {
 				return
 			}
@@ -105,6 +101,7 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 				s.processAckMessage(message)
 			case MsgData:
 				s.processReceivedMessage(message)
+				s.processReceivedMessageLoop(s.clients[message.ConnID])
 				s.clients[message.ConnID].writeChan <- NewAck(message.ConnID, message.SeqNum)
 			case MsgConnect:
 				client := &clientStub{
@@ -131,30 +128,24 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 				s.mutex.Unlock()
 				client.writeChan <- NewAck(client.connID, int(client.seqNum))
 				s.nextClientID++
-				fmt.Println(client.addr, client.connID, len(s.clients))
 				go s.handleWrite(client)
-				go s.processReceivedMessageLoop(client)
 			}
 		}
 	}
 }
 
 func (s *server) processReceivedMessageLoop(client *clientStub) {
-	for {
-		if client.pendingReceivedMessageQueue.Len() != 0 {
-			e := client.pendingReceivedMessageQueue.Front()
-			message := e.Value.(*Message)
-			fmt.Println("message", message.String())
-			if !client.isClosed {
-				select {
-				case s.readChan <- message:
-					client.pendingReceivedMessageQueue.Remove(e)
-				}
-			} else {
-				select {
-				case s.readChan <- message:
-					client.pendingReceivedMessageQueue.Remove(e)
-				}
+	for e := client.pendingReceivedMessageQueue.Front(); e != nil; e = client.pendingReceivedMessageQueue.Front() {
+		message := e.Value.(*Message)
+		if !client.isClosed {
+			select {
+			case s.readChan <- message:
+				client.pendingReceivedMessageQueue.Remove(e)
+			}
+		} else {
+			select {
+			case s.readChan <- message:
+				client.pendingReceivedMessageQueue.Remove(e)
 			}
 		}
 	}
@@ -188,9 +179,7 @@ func (s *server) handleWrite(client *clientStub) {
 				return
 			}
 			if message.Type == MsgData {
-				client.mutex.Lock()
 				client.pendingReSendMessages[message.SeqNum] = message
-				client.mutex.Unlock()
 			}
 			if !s.isClosed && !client.isClosed {
 				_, err = client.conn.WriteToUDP(bytes, client.addr)
@@ -229,9 +218,7 @@ func (s *server) Write(connID int, payload []byte) error {
 		c.writeChan <- message
 		return nil
 	}
-	c.mutex.Lock()
 	c.pendingSendMessages.PushBack(message)
-	c.mutex.Unlock()
 	return nil
 }
 
@@ -256,8 +243,6 @@ func (s *server) Close() error {
 }
 
 func (s *server) resendAckMessages() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
 	for _, client := range s.clients {
 		if atomic.LoadInt32(&client.lastProcessedMessageSeqNum) == 0 && !client.isClosed {
 			client.writeChan <- NewAck(client.connID, 0)
@@ -285,8 +270,6 @@ func (s *server) processAckMessage(message *Message) {
 		return
 	}
 	c := s.clients[message.ConnID]
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	if message, ok := c.pendingReSendMessages[message.SeqNum]; ok {
 		delete(c.pendingReSendMessages, message.SeqNum)
 		delete(c.unAckedMessages, message.SeqNum)
@@ -299,7 +282,6 @@ func (s *server) processAckMessage(message *Message) {
 				c.slideWindow.Remove(e)
 			}
 			c.processPendingSendMessages()
-			fmt.Println("========ack:", message.String())
 		}
 	}
 }
@@ -310,7 +292,7 @@ func (c *clientStub) processPendingSendMessages() {
 		// 如果的消息超过了滑动窗口的上线，则暂存消息，等待后续处理
 		next = e.Next()
 		message := e.Value.(*Message)
-		if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize <= message.SeqNum {
+		if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize < message.SeqNum {
 			break
 		}
 		c.slideWindow.PushBack(message)
@@ -323,12 +305,12 @@ func (c *clientStub) processPendingSendMessages() {
 func (s *server) processPendingReSendMessages() {
 	for _, c := range s.clients {
 		for _, message := range c.pendingReSendMessages {
-			if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize >= message.SeqNum {
-				if _, ok := c.unAckedMessages[message.SeqNum]; ok {
-					c.writeChan <- message
-				}
+			if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize < message.SeqNum {
+				continue
 			}
-
+			if _, ok := c.unAckedMessages[message.SeqNum]; ok {
+				c.writeChan <- message
+			}
 		}
 	}
 }
