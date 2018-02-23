@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"sync/atomic"
+	"time"
 )
 
 var enableDebugLogs uint32
@@ -167,4 +168,12 @@ func (c *UDPConn) Close() error {
 
 func sometimes(percentage int) bool {
 	return rand.Intn(100) < percentage
+}
+
+func (c *UDPConn) SetDeadline(t time.Time) error {
+	return c.nconn.SetDeadline(t)
+}
+
+func (c *UDPConn) SetReadDeadline(t time.Time) error {
+	return c.nconn.SetReadDeadline(t)
 }

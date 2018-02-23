@@ -4,6 +4,7 @@ package lsp
 
 import (
 	"container/list"
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,11 +37,11 @@ type client struct {
 	epochFiredCount int32
 	epochTimer      *time.Ticker
 	epochLimit      int
-	epochMills      int
+	epochMillis     int
 
 	// 退出相关
-	isClosed                bool
-	connLost                bool
+	isClosed                int32
+	isLost                  int32
 	eventsRoutineExitChan   chan int
 	toExitEventsRoutineChan chan int
 	readRoutineExitChan     chan int
@@ -75,7 +76,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		connID:    0,
 
 		epochLimit:                  params.EpochLimit,
-		epochMills:                  params.EpochMillis,
+		epochMillis:                 params.EpochMillis,
 		windowSize:                  params.WindowSize,
 		epochTimer:                  time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis)),
 		seqNum:                      0,
@@ -91,8 +92,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		pendingReSendMessages:       make(map[int]*Message),
 		unAckedMessages:             make(map[int]bool),
 		receivedMessageChan:         make(chan *Message),
-		isClosed:                    false,
-		connLost:                    false,
+		isClosed:                    0,
+		isLost:                      0,
 		closeChan:                   make(chan int),
 		eventsRoutineExitChan:       make(chan int),
 		toExitEventsRoutineChan:     make(chan int),
@@ -104,6 +105,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 	_, err = c.conn.Write(bytes)
+	var ack = make([]byte, MaxMessageSize)
 	for {
 		select {
 		case <-c.epochTimer.C:
@@ -120,14 +122,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 				continue
 			}
 		default:
-			var ack = make([]byte, MaxMessageSize)
-			var n int
-			n, _, err := c.conn.ReadFromUDP(ack)
+			ackMessage, _, err := c.clientRecvMessage(ack)
 			if err != nil {
 				continue
 			}
 			atomic.StoreInt32(&c.epochFiredCount, 0)
-			ackMessage := UnMarshalMessage(ack[:n])
 			if ackMessage.Type == MsgAck && ackMessage.SeqNum == 0 {
 				c.connID = ackMessage.ConnID
 				go c.handleRead()
@@ -157,7 +156,7 @@ func (c *client) sendAck(msg *Message) {
 }
 
 func (c *client) Write(payload []byte) error {
-	if c.isClosed || c.connLost {
+	if c.isConnClosed() || c.isConnLost() {
 		return ErrConnClosed
 	}
 	atomic.AddInt32(&c.seqNum, 1)
@@ -165,6 +164,20 @@ func (c *client) Write(payload []byte) error {
 	// 如果的消息超过了滑动窗口的上线，则暂存消息，等待后续处理
 	c.writeChan <- message
 	return nil
+}
+
+func (c *client) isConnClosed() bool {
+	if atomic.LoadInt32(&c.isClosed) == 0 {
+		return false
+	}
+	return true
+}
+
+func (c *client) isConnLost() bool {
+	if atomic.LoadInt32(&c.isLost) == 0 {
+		return false
+	}
+	return true
 }
 
 func (c *client) Close() error {
@@ -184,29 +197,24 @@ func (c *client) handleRead() {
 			return
 		default:
 			payload := make([]byte, MaxMessageSize)
-			if c.isClosed {
-				return
-			}
-			n, err := c.conn.Read(payload)
+			message, _, err := c.clientRecvMessage(payload)
 			if err != nil {
-				return
+				continue
 			}
-			message := UnMarshalMessage(payload[:n])
 			atomic.StoreInt32(&c.epochFiredCount, 0)
 			switch message.Type {
 			case MsgData:
-				if !c.isClosed || !c.connLost {
-					c.sendAck(NewAck(message.ConnID, message.SeqNum))
+				if !c.isConnClosed() || !c.isConnLost() {
+					c.writeChan <- NewAck(message.ConnID, message.SeqNum)
 					// 若收到第一个data message，则epochTimer触发时，不用再发送ACK
 					atomic.StoreInt32(&c.epochFiredCount, 0)
 					atomic.AddInt32(&c.receivedMessageSeqNum, 1)
 					c.receivedMessageChan <- message
 				}
 			case MsgAck:
-				if !c.connLost {
-					//c.processAckMessage(message)
+				if !c.isConnLost() {
 					c.receivedMessageChan <- message
-					if c.isClosed && c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 {
+					if c.isConnClosed() && c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 {
 						c.epochTimer.Stop()
 						c.toExitEventsRoutineChan <- 1
 					}
@@ -218,17 +226,26 @@ func (c *client) handleRead() {
 
 func (c *client) handleEvents() {
 	for {
+		if c.pendingReceivedMessageQueue.Len() != 0 {
+			c.prepareReadMessage()
+		}
+
 		select {
 		case message := <-c.writeChan:
-			if !c.isClosed {
-				c.pendingSendMessages.PushBack(message)
-				c.processPendingSendMessages(sendMessageToServer)
+			if !c.isConnClosed() {
+				switch message.Type {
+				case MsgData:
+					c.pendingSendMessages.PushBack(message)
+					c.processPendingSendMessages(sendMessageToServer)
+				case MsgAck:
+					c.sendAck(message)
+				}
 			}
 		case <-c.epochTimer.C:
 			atomic.AddInt32(&c.epochFiredCount, 1)
 			if int(atomic.LoadInt32(&c.epochFiredCount)) > c.epochLimit {
-				c.connLost = true
-				if c.isClosed {
+				atomic.StoreInt32(&c.isLost, 1)
+				if c.isConnClosed() {
 					c.epochTimer.Stop()
 					c.toExitEventsRoutineChan <- 1
 				}
@@ -240,8 +257,8 @@ func (c *client) handleEvents() {
 			c.processReceivedMessage(msg)
 			c.prepareReadMessage()
 		case <-c.closeChan:
-			c.isClosed = true
-			if c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 || c.connLost {
+			atomic.StoreInt32(&c.isClosed, 1)
+			if c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 || c.isConnLost() {
 				c.epochTimer.Stop()
 				c.toExitEventsRoutineChan <- 1
 			}
@@ -330,7 +347,7 @@ func (c *client) processPendingReSendMessages(sendMessage func(*client, *Message
 }
 
 func (c *client) resendAckMessages(sendMessage func(*client, *Message)) {
-	if atomic.LoadInt32(&c.receivedMessageSeqNum) == 0 && !c.isClosed {
+	if atomic.LoadInt32(&c.receivedMessageSeqNum) == 0 {
 		sendMessage(c, NewAck(c.connID, 0))
 	} else {
 		i := c.lastProcessedMessageSeqNum - 1
@@ -350,4 +367,18 @@ func sendMessageToServer(c *client, message *Message) {
 	if err != nil {
 		return
 	}
+}
+
+func (c *client) clientRecvMessage(readBytes []byte) (*Message, *lspnet.UDPAddr, error) {
+	c.conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(c.epochMillis)))
+	readSize, rAddr, err := c.conn.ReadFromUDP(readBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	var msg Message
+	err = json.Unmarshal(readBytes[:readSize], &msg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &msg, rAddr, nil
 }

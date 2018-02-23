@@ -78,12 +78,13 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 				client := s.clients[message.ConnID]
 				atomic.AddInt32(&client.receivedMessageSeqNum, 1)
 				atomic.StoreInt32(&client.epochFiredCount, 0)
-				sendMessageToClient(client, NewAck(message.ConnID, message.SeqNum))
+				client.writeChan <- NewAck(message.ConnID, message.SeqNum)
 				client.receivedMessageChan <- message
 			case MsgConnect:
 				client := &client{
 					connID:                      int(s.nextClientID),
-					isClosed:                    false,
+					isClosed:                    0,
+					isLost:                      0,
 					closeChan:                   make(chan int),
 					writeChan:                   make(chan *Message, 10),
 					addr:                        addr,
@@ -107,7 +108,7 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 				s.mutex.Lock()
 				s.clients[s.nextClientID] = client
 				s.mutex.Unlock()
-				sendMessageToClient(client, NewAck(client.connID, int(client.seqNum)))
+				client.writeChan <- NewAck(client.connID, int(client.seqNum))
 				s.nextClientID++
 				go s.handleEvents(client)
 			}
@@ -117,17 +118,24 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 
 func (s *server) handleEvents(c *client) {
 	for {
+		if c.pendingReceivedMessageQueue.Len() != 0 {
+			s.prepareReadMessage(c)
+		}
+
 		select {
 		case message, ok := <-c.writeChan:
 			if !ok {
 				return
 			}
-			if message.Type == MsgData {
+			switch message.Type {
+			case MsgData:
 				c.pendingSendMessages.PushBack(message)
 				c.processPendingSendMessages(sendMessageToClient)
+			case MsgAck:
+				sendMessageToClient(c, NewAck(message.ConnID, message.SeqNum))
 			}
 		case <-c.epochTimer.C:
-			if c.isClosed {
+			if c.isConnClosed() {
 				return
 			}
 			atomic.AddInt32(&c.epochFiredCount, 1)
@@ -159,7 +167,7 @@ func (s *server) Write(connID int, payload []byte) error {
 		return ErrConnClosed
 	}
 	c, ok := s.clients[connID]
-	if !ok || c.isClosed {
+	if !ok || c.isConnClosed() {
 		return ErrConnClosed
 	}
 	atomic.AddInt32(&c.seqNum, 1)
