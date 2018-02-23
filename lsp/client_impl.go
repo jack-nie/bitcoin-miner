@@ -107,7 +107,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	for {
 		select {
 		case <-c.epochTimer.C:
-			if int(atomic.LoadInt32(&c.epochFiredCount)) >= c.epochLimit {
+			atomic.AddInt32(&c.epochFiredCount, 1)
+			if int(atomic.LoadInt32(&c.epochFiredCount)) > c.epochLimit {
 				return nil, ErrCannotEstablishConnection
 			}
 			bytes, err := MarshalMessage(NewConnect())
@@ -116,7 +117,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 			}
 			_, err = c.conn.Write(bytes)
 			if err != nil {
-				atomic.AddInt32(&c.epochFiredCount, 1)
+				continue
 			}
 		default:
 			var ack = make([]byte, MaxMessageSize)
@@ -152,10 +153,7 @@ func (c *client) Read() ([]byte, error) {
 }
 
 func (c *client) sendAck(msg *Message) {
-	if msg.Type == MsgData {
-		ack := NewAck(msg.ConnID, msg.SeqNum)
-		c.writeChan <- ack
-	}
+	sendMessageToServer(c, NewAck(msg.ConnID, msg.SeqNum))
 }
 
 func (c *client) Write(payload []byte) error {
@@ -165,16 +163,7 @@ func (c *client) Write(payload []byte) error {
 	atomic.AddInt32(&c.seqNum, 1)
 	message := NewData(c.connID, int(c.seqNum), len(payload), payload)
 	// 如果的消息超过了滑动窗口的上线，则暂存消息，等待后续处理
-	if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize >= message.SeqNum {
-		c.slideWindow.PushBack(message)
-		c.unAckedMessages[message.SeqNum] = false
-		c.writeChan <- message
-		return nil
-	}
-
-	c.mutex.Lock()
-	c.pendingSendMessages.PushBack(message)
-	c.mutex.Unlock()
+	c.writeChan <- message
 	return nil
 }
 
@@ -207,7 +196,7 @@ func (c *client) handleRead() {
 			switch message.Type {
 			case MsgData:
 				if !c.isClosed || !c.connLost {
-					c.sendAck(message)
+					c.sendAck(NewAck(message.ConnID, message.SeqNum))
 					// 若收到第一个data message，则epochTimer触发时，不用再发送ACK
 					atomic.StoreInt32(&c.epochFiredCount, 0)
 					atomic.AddInt32(&c.receivedMessageSeqNum, 1)
@@ -215,7 +204,8 @@ func (c *client) handleRead() {
 				}
 			case MsgAck:
 				if !c.connLost {
-					c.processAckMessage(message)
+					//c.processAckMessage(message)
+					c.receivedMessageChan <- message
 					if c.isClosed && c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 {
 						c.epochTimer.Stop()
 						c.toExitEventsRoutineChan <- 1
@@ -231,17 +221,8 @@ func (c *client) handleEvents() {
 		select {
 		case message := <-c.writeChan:
 			if !c.isClosed {
-				if message.Type == MsgData {
-					c.pendingReSendMessages[message.SeqNum] = message
-				}
-				bytes, err := MarshalMessage(message)
-				if err != nil {
-					continue
-				}
-				_, err = c.conn.Write(bytes)
-				if err != nil {
-					continue
-				}
+				c.pendingSendMessages.PushBack(message)
+				c.processPendingSendMessages(sendMessageToServer)
 			}
 		case <-c.epochTimer.C:
 			atomic.AddInt32(&c.epochFiredCount, 1)
@@ -252,8 +233,8 @@ func (c *client) handleEvents() {
 					c.toExitEventsRoutineChan <- 1
 				}
 			} else {
-				c.processPendingReSendMessages()
-				c.resendAckMessages()
+				c.processPendingReSendMessages(sendMessageToServer)
+				c.resendAckMessages(sendMessageToServer)
 			}
 		case msg := <-c.receivedMessageChan:
 			c.processReceivedMessage(msg)
@@ -271,17 +252,23 @@ func (c *client) handleEvents() {
 }
 
 func (c *client) processReceivedMessage(message *Message) {
-	if _, ok := c.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(c.lastProcessedMessageSeqNum) {
-		c.pendingReceivedMessages[message.SeqNum] = message
-		for i := int(c.lastProcessedMessageSeqNum); ; i++ {
-			if _, ok := c.pendingReceivedMessages[i]; !ok {
-				break
+	switch message.Type {
+	case MsgData:
+		if _, ok := c.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(c.lastProcessedMessageSeqNum) {
+			c.pendingReceivedMessages[message.SeqNum] = message
+			for i := int(c.lastProcessedMessageSeqNum); ; i++ {
+				if _, ok := c.pendingReceivedMessages[i]; !ok {
+					break
+				}
+				c.pendingReceivedMessageQueue.PushBack(c.pendingReceivedMessages[i])
+				delete(c.pendingReceivedMessages, i)
+				atomic.AddInt32(&c.lastProcessedMessageSeqNum, 1)
 			}
-			c.pendingReceivedMessageQueue.PushBack(c.pendingReceivedMessages[i])
-			delete(c.pendingReceivedMessages, i)
-			atomic.AddInt32(&c.lastProcessedMessageSeqNum, 1)
 		}
+	case MsgAck:
+		c.processAckMessage(message, sendMessageToServer)
 	}
+
 }
 
 func (c *client) prepareReadMessage() {
@@ -295,9 +282,7 @@ func (c *client) prepareReadMessage() {
 	}
 }
 
-func (c *client) processAckMessage(message *Message) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+func (c *client) processAckMessage(message *Message, sendMessage func(*client, *Message)) {
 	if message.SeqNum == 0 {
 		return
 	}
@@ -312,56 +297,54 @@ func (c *client) processAckMessage(message *Message) {
 				atomic.AddInt32(&c.lastAckSeqNum, 1)
 				c.slideWindow.Remove(e)
 			}
-			c.processPendingSendMessages()
+			c.processPendingSendMessages(sendMessage)
 		}
 	}
 }
 
-func (c *client) processPendingSendMessages() {
+func (c *client) processPendingSendMessages(sendMessage func(*client, *Message)) {
 	var next *list.Element
 	for e := c.pendingSendMessages.Front(); e != nil; e = next {
 		// 如果的消息超过了滑动窗口的上线，则暂存消息，等待后续处理
 		next = e.Next()
 		message := e.Value.(*Message)
 		if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize < message.SeqNum {
-			break
+			return
 		}
 		c.slideWindow.PushBack(message)
+		c.pendingReSendMessages[message.SeqNum] = message
 		c.unAckedMessages[message.SeqNum] = true
 		c.pendingSendMessages.Remove(e)
-		c.writeChan <- message
+		sendMessage(c, message)
 	}
 }
 
-func (c *client) processPendingReSendMessages() {
+func (c *client) processPendingReSendMessages(sendMessage func(*client, *Message)) {
 	for _, message := range c.pendingReSendMessages {
 		if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize >= message.SeqNum {
 			if _, ok := c.unAckedMessages[message.SeqNum]; ok {
-				c.sendMessage(message)
+				sendMessage(c, message)
 			}
 		}
 	}
 }
 
-func (c *client) resendAckMessages() {
+func (c *client) resendAckMessages(sendMessage func(*client, *Message)) {
 	if atomic.LoadInt32(&c.receivedMessageSeqNum) == 0 && !c.isClosed {
-		c.sendMessage(NewAck(c.connID, 0))
+		sendMessage(c, NewAck(c.connID, 0))
 	} else {
 		i := c.lastProcessedMessageSeqNum - 1
 		for j := c.windowSize; j > 0 && i > 0; j-- {
-			c.sendMessage(NewAck(c.connID, int(i)))
+			sendMessage(c, NewAck(c.connID, int(i)))
 			i--
 		}
 	}
 }
 
-func (c *client) sendMessage(message *Message) {
+func sendMessageToServer(c *client, message *Message) {
 	bytes, err := MarshalMessage(message)
 	if err != nil {
 		return
-	}
-	if message.Type == MsgData {
-		c.pendingReSendMessages[message.SeqNum] = message
 	}
 	_, err = c.conn.Write(bytes)
 	if err != nil {

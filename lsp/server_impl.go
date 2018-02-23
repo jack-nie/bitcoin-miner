@@ -73,12 +73,12 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 			switch message.Type {
 			case MsgAck:
 				client := s.clients[message.ConnID]
-				client.processAckMessage(message)
+				client.receivedMessageChan <- message
 			case MsgData:
 				client := s.clients[message.ConnID]
 				atomic.AddInt32(&client.receivedMessageSeqNum, 1)
 				atomic.StoreInt32(&client.epochFiredCount, 0)
-				client.writeChan <- NewAck(message.ConnID, message.SeqNum)
+				sendMessageToClient(client, NewAck(message.ConnID, message.SeqNum))
 				client.receivedMessageChan <- message
 			case MsgConnect:
 				client := &client{
@@ -107,7 +107,7 @@ func (s *server) handleConn(conn *lspnet.UDPConn) {
 				s.mutex.Lock()
 				s.clients[s.nextClientID] = client
 				s.mutex.Unlock()
-				client.writeChan <- NewAck(client.connID, int(client.seqNum))
+				sendMessageToClient(client, NewAck(client.connID, int(client.seqNum)))
 				s.nextClientID++
 				go s.handleEvents(client)
 			}
@@ -122,20 +122,9 @@ func (s *server) handleEvents(c *client) {
 			if !ok {
 				return
 			}
-			bytes, err := MarshalMessage(message)
-			if err != nil {
-				return
-			}
 			if message.Type == MsgData {
-				c.mutex.Lock()
-				c.pendingReSendMessages[message.SeqNum] = message
-				c.mutex.Unlock()
-			}
-			if !s.isClosed && !c.isClosed {
-				_, err = c.conn.WriteToUDP(bytes, c.addr)
-				if err != nil {
-					return
-				}
+				c.pendingSendMessages.PushBack(message)
+				c.processPendingSendMessages(sendMessageToClient)
 			}
 		case <-c.epochTimer.C:
 			if c.isClosed {
@@ -145,8 +134,8 @@ func (s *server) handleEvents(c *client) {
 			if int(atomic.LoadInt32(&c.epochFiredCount)) > c.epochLimit {
 				return
 			}
-			c.processPendingReSendMessages()
-			c.resendAckMessages()
+			c.processPendingReSendMessages(sendMessageToClient)
+			c.resendAckMessages(sendMessageToClient)
 		case msg := <-c.receivedMessageChan:
 			c.processReceivedMessage(msg)
 			s.prepareReadMessage(c)
@@ -175,15 +164,9 @@ func (s *server) Write(connID int, payload []byte) error {
 	}
 	atomic.AddInt32(&c.seqNum, 1)
 	message := NewData(connID, int(c.seqNum), len(payload), payload)
-	if int(atomic.LoadInt32(&c.lastAckSeqNum))+c.windowSize >= message.SeqNum {
-		c.mutex.Lock()
-		c.slideWindow.PushBack(message)
-		c.unAckedMessages[message.SeqNum] = true
-		c.mutex.Unlock()
-		c.writeChan <- message
-		return nil
-	}
-	c.pendingSendMessages.PushBack(message)
+
+	c.writeChan <- message
+
 	return nil
 }
 
@@ -213,9 +196,18 @@ func (s *server) prepareReadMessage(c *client) {
 		message := e.Value.(*Message)
 		select {
 		case s.readChan <- message:
-			c.mutex.Lock()
 			c.pendingReceivedMessageQueue.Remove(e)
-			c.mutex.Unlock()
 		}
+	}
+}
+
+func sendMessageToClient(client *client, message *Message) {
+	bytes, err := MarshalMessage(message)
+	if err != nil {
+		return
+	}
+	_, err = client.conn.WriteToUDP(bytes, client.addr)
+	if err != nil {
+		return
 	}
 }
