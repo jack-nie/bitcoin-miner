@@ -40,12 +40,13 @@ type client struct {
 	epochMillis     int
 
 	// 退出相关
-	isClosed                int32
-	isLost                  int32
-	eventsRoutineExitChan   chan int
-	toExitEventsRoutineChan chan int
-	readRoutineExitChan     chan int
-	closeChan               chan int
+	isClosed              int32
+	isLost                int32
+	eventsRoutineExitChan chan int
+	toExitRoutineChan     chan int
+	readRoutineExitChan   chan int
+	closeChan             chan int
+	toCloseChan           chan int
 
 	addr *lspnet.UDPAddr
 }
@@ -95,8 +96,9 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		isClosed:                    0,
 		isLost:                      0,
 		closeChan:                   make(chan int),
+		toCloseChan:                 make(chan int),
 		eventsRoutineExitChan:       make(chan int),
-		toExitEventsRoutineChan:     make(chan int),
+		toExitRoutineChan:           make(chan int),
 		readRoutineExitChan:         make(chan int),
 	}
 
@@ -147,6 +149,9 @@ func (c *client) Read() ([]byte, error) {
 	case <-c.closeChan:
 		return nil, ErrConnClosed
 	case msg := <-c.readChan:
+		if msg.SeqNum == -1 {
+			return msg.Payload, ErrConnClosed
+		}
 		return msg.Payload, nil
 	}
 }
@@ -181,19 +186,18 @@ func (c *client) isConnLost() bool {
 }
 
 func (c *client) Close() error {
-	c.closeChan <- 1
-	<-c.toExitEventsRoutineChan
+	c.toCloseChan <- 1
+	<-c.toExitRoutineChan
 
 	c.conn.Close()
-	c.readRoutineExitChan <- 1
-	c.eventsRoutineExitChan <- 1
 	return nil
 }
 
 func (c *client) handleRead() {
 	for {
 		select {
-		case <-c.readRoutineExitChan:
+		case <-c.closeChan:
+			c.toExitRoutineChan <- 1
 			return
 		default:
 			payload := make([]byte, MaxMessageSize)
@@ -204,21 +208,13 @@ func (c *client) handleRead() {
 			atomic.StoreInt32(&c.epochFiredCount, 0)
 			switch message.Type {
 			case MsgData:
-				if !c.isConnClosed() || !c.isConnLost() {
-					c.writeChan <- NewAck(message.ConnID, message.SeqNum)
-					// 若收到第一个data message，则epochTimer触发时，不用再发送ACK
-					atomic.StoreInt32(&c.epochFiredCount, 0)
-					atomic.AddInt32(&c.receivedMessageSeqNum, 1)
-					c.receivedMessageChan <- message
-				}
+				c.writeChan <- NewAck(message.ConnID, message.SeqNum)
+				atomic.StoreInt32(&c.epochFiredCount, 0)
+				// 若收到第一个data message，则epochTimer触发时，不用再发送ACK
+				atomic.AddInt32(&c.receivedMessageSeqNum, 1)
+				c.receivedMessageChan <- message
 			case MsgAck:
-				if !c.isConnLost() {
-					c.receivedMessageChan <- message
-					if c.isConnClosed() && c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 {
-						c.epochTimer.Stop()
-						c.toExitEventsRoutineChan <- 1
-					}
-				}
+				c.receivedMessageChan <- message
 			}
 		}
 	}
@@ -228,6 +224,11 @@ func (c *client) handleEvents() {
 	for {
 		if c.pendingReceivedMessageQueue.Len() != 0 {
 			c.prepareReadMessage()
+		}
+
+		if atomic.LoadInt32(&c.isLost) != 0 {
+			c.closeChan <- 1
+			return
 		}
 
 		select {
@@ -245,47 +246,62 @@ func (c *client) handleEvents() {
 			atomic.AddInt32(&c.epochFiredCount, 1)
 			if int(atomic.LoadInt32(&c.epochFiredCount)) > c.epochLimit {
 				atomic.StoreInt32(&c.isLost, 1)
-				if c.isConnClosed() {
-					c.epochTimer.Stop()
-					c.toExitEventsRoutineChan <- 1
-				}
-			} else {
-				c.processPendingReSendMessages(sendMessageToServer)
-				c.resendAckMessages(sendMessageToServer)
-			}
-		case msg := <-c.receivedMessageChan:
-			c.processReceivedMessage(msg)
-			c.prepareReadMessage()
-		case <-c.closeChan:
-			atomic.StoreInt32(&c.isClosed, 1)
-			if c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 || c.isConnLost() {
 				c.epochTimer.Stop()
-				c.toExitEventsRoutineChan <- 1
+				return
 			}
-		case <-c.eventsRoutineExitChan:
-			return
+			c.processPendingReSendMessages(sendMessageToServer)
+			c.resendAckMessages(sendMessageToServer)
+
+		case msg := <-c.receivedMessageChan:
+			switch msg.Type {
+			case MsgAck:
+				c.processAckMessage(msg, sendMessageToServer)
+			case MsgData:
+				c.processReceivedMessage(msg)
+			}
+			if c.checkCloseComplete() {
+				c.closeChan <- 1
+				return
+			}
+			c.prepareReadMessage()
+
+		case <-c.toCloseChan:
+			if c.processCloseChan() {
+				c.closeChan <- 1
+				return
+			}
 		}
 	}
 }
 
 func (c *client) processReceivedMessage(message *Message) {
-	switch message.Type {
-	case MsgData:
-		if _, ok := c.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(c.lastProcessedMessageSeqNum) {
-			c.pendingReceivedMessages[message.SeqNum] = message
-			for i := int(c.lastProcessedMessageSeqNum); ; i++ {
-				if _, ok := c.pendingReceivedMessages[i]; !ok {
-					break
-				}
-				c.pendingReceivedMessageQueue.PushBack(c.pendingReceivedMessages[i])
-				delete(c.pendingReceivedMessages, i)
-				atomic.AddInt32(&c.lastProcessedMessageSeqNum, 1)
+	if _, ok := c.pendingReceivedMessages[message.SeqNum]; !ok && message.SeqNum >= int(c.lastProcessedMessageSeqNum) {
+		c.pendingReceivedMessages[message.SeqNum] = message
+		for i := int(c.lastProcessedMessageSeqNum); ; i++ {
+			if _, ok := c.pendingReceivedMessages[i]; !ok {
+				break
 			}
+			c.pendingReceivedMessageQueue.PushBack(c.pendingReceivedMessages[i])
+			delete(c.pendingReceivedMessages, i)
+			atomic.AddInt32(&c.lastProcessedMessageSeqNum, 1)
 		}
-	case MsgAck:
-		c.processAckMessage(message, sendMessageToServer)
 	}
+}
 
+func (c *client) checkCloseComplete() bool {
+	if c.isConnClosed() && c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 && len(c.unAckedMessages) == 0 && len(c.writeChan) == 0 {
+		return true
+	}
+	return false
+}
+
+func (c *client) processCloseChan() bool {
+	atomic.StoreInt32(&c.isClosed, 1)
+	c.epochTimer.Stop()
+	if c.pendingSendMessages.Len() == 0 && len(c.pendingReSendMessages) == 0 && len(c.unAckedMessages) == 0 && len(c.writeChan) == 0 {
+		return true
+	}
+	return false
 }
 
 func (c *client) prepareReadMessage() {
@@ -295,6 +311,11 @@ func (c *client) prepareReadMessage() {
 		select {
 		case c.readChan <- message:
 			c.pendingReceivedMessageQueue.Remove(e)
+		case <-c.toCloseChan:
+			if c.processCloseChan() {
+				c.closeChan <- c.connID
+				return
+			}
 		}
 	}
 }
